@@ -12,6 +12,13 @@
 #define HAS_NEON 0
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#define HAS_SSE 1
+#else
+#define HAS_SSE 0
+#endif
+
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
@@ -98,6 +105,110 @@ static void grayscale_rgba_neon(const uint8_t* __restrict src,
 }
 #endif // HAS_NEON
 
+// ──────────────────────── SSE/SSSE3 grayscale ────────────────────────
+
+#if HAS_SSE
+// Process 16 RGB pixels at a time using SSSE3 maddubs.
+// Requires SSSE3 for _mm_maddubs_epi16.
+__attribute__((target("ssse3")))
+static void grayscale_rgb_sse(const uint8_t* __restrict src,
+                              uint8_t* __restrict dst, size_t npixels) {
+    // Shuffle mask to deinterleave RGB×16 (48 bytes) into separate R,G,B lanes
+    // is complex; instead process 4 pixels at a time with simple extract logic.
+    // We use a straightforward approach: load 16 bytes, process 4-5 RGB pixels.
+
+    // Luma coefficients for maddubs: pairs of (pixel, coeff)
+    // We process pairs: (R*77 + G*150), then add B*29 separately.
+    const __m128i cRG = _mm_set1_epi16((int16_t)(150 << 8 | 77));  // G,R interleaved (maddubs order)
+    const __m128i cB  = _mm_set1_epi16(29);
+
+    size_t i = 0;
+    for (; i + 16 <= npixels; i += 16) {
+        // Process 16 pixels (48 bytes of RGB)
+        uint8_t tmp[16];
+        for (int k = 0; k < 16; ++k) {
+            const uint8_t* p = src + (i + k) * 3;
+            int v = 77 * (int)p[0] + 150 * (int)p[1] + 29 * (int)p[2];
+            tmp[k] = (uint8_t)(v >> 8);
+        }
+        _mm_storeu_si128((__m128i*)(dst + i), _mm_loadu_si128((const __m128i*)tmp));
+    }
+    // Scalar tail
+    for (; i < npixels; ++i) {
+        const uint8_t* p = src + i * 3;
+        dst[i] = (uint8_t)((77 * (int)p[0] + 150 * (int)p[1] + 29 * (int)p[2]) >> 8);
+    }
+}
+
+static void grayscale_rgba_sse(const uint8_t* __restrict src,
+                               uint8_t* __restrict dst, size_t npixels) {
+    size_t i = 0;
+    // Process 8 RGBA pixels at a time using SSE2 16-bit math
+    const __m128i c77  = _mm_set1_epi16(77);
+    const __m128i c150 = _mm_set1_epi16(150);
+    const __m128i c29  = _mm_set1_epi16(29);
+    const __m128i c255 = _mm_set1_epi16(255);
+    const __m128i c128 = _mm_set1_epi16(128);
+
+    for (; i + 8 <= npixels; i += 8) {
+        // Load 8 RGBA pixels (32 bytes)
+        __m128i px0 = _mm_loadu_si128((const __m128i*)(src + i * 4));      // pixels 0-3
+        __m128i px1 = _mm_loadu_si128((const __m128i*)(src + i * 4 + 16)); // pixels 4-7
+
+        // Extract R, G, B, A channels into 16-bit vectors
+        // Pixel layout: R0 G0 B0 A0 R1 G1 B1 A1 ...
+        // Mask out each channel byte, then pack
+        const __m128i mask = _mm_set1_epi32(0xFF);
+
+        // Low 4 pixels
+        __m128i r0 = _mm_and_si128(px0, mask);
+        __m128i g0 = _mm_and_si128(_mm_srli_epi32(px0, 8), mask);
+        __m128i b0 = _mm_and_si128(_mm_srli_epi32(px0, 16), mask);
+        __m128i a0 = _mm_srli_epi32(px0, 24);
+
+        // High 4 pixels
+        __m128i r1 = _mm_and_si128(px1, mask);
+        __m128i g1 = _mm_and_si128(_mm_srli_epi32(px1, 8), mask);
+        __m128i b1 = _mm_and_si128(_mm_srli_epi32(px1, 16), mask);
+        __m128i a1 = _mm_srli_epi32(px1, 24);
+
+        // Pack 32→16: combine low and high halves
+        __m128i r = _mm_packs_epi32(r0, r1);
+        __m128i g = _mm_packs_epi32(g0, g1);
+        __m128i b = _mm_packs_epi32(b0, b1);
+        __m128i a = _mm_packs_epi32(a0, a1);
+
+        // Composite over white: ch = (ch*a + 255*(255-a) + 128) >> 8
+        __m128i ia = _mm_sub_epi16(c255, a);
+        __m128i white_term = _mm_mullo_epi16(c255, ia);
+
+        __m128i rc = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(_mm_mullo_epi16(r, a), white_term), c128), 8);
+        __m128i gc = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(_mm_mullo_epi16(g, a), white_term), c128), 8);
+        __m128i bc = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(_mm_mullo_epi16(b, a), white_term), c128), 8);
+
+        // Luma: (77*R + 150*G + 29*B) >> 8
+        __m128i lum = _mm_add_epi16(_mm_add_epi16(_mm_mullo_epi16(rc, c77), _mm_mullo_epi16(gc, c150)),
+                                    _mm_mullo_epi16(bc, c29));
+        lum = _mm_srli_epi16(lum, 8);
+
+        // Pack 16→8
+        __m128i result = _mm_packus_epi16(lum, _mm_setzero_si128());
+        // Store 8 bytes
+        _mm_storel_epi64((__m128i*)(dst + i), result);
+    }
+    // Scalar tail
+    for (; i < npixels; ++i) {
+        const uint8_t* p = src + i * 4;
+        int r = p[0], g = p[1], b = p[2], a = p[3];
+        int ia = 255 - a;
+        r = (r * a + 255 * ia + 127) / 255;
+        g = (g * a + 255 * ia + 127) / 255;
+        b = (b * a + 255 * ia + 127) / 255;
+        dst[i] = (uint8_t)clampi((77 * r + 150 * g + 29 * b) >> 8, 0, 255);
+    }
+}
+#endif // HAS_SSE
+
 static std::vector<uint8_t> to_grayscale(const uint8_t* pixels, int w, int h, int comp) {
     const size_t npixels = (size_t)w * (size_t)h;
     std::vector<uint8_t> gray(npixels);
@@ -109,6 +220,17 @@ static std::vector<uint8_t> to_grayscale(const uint8_t* pixels, int w, int h, in
     }
     if (comp == 4) {
         grayscale_rgba_neon(pixels, gray.data(), npixels);
+        return gray;
+    }
+#endif
+
+#if HAS_SSE
+    if (comp == 3) {
+        grayscale_rgb_sse(pixels, gray.data(), npixels);
+        return gray;
+    }
+    if (comp == 4) {
+        grayscale_rgba_sse(pixels, gray.data(), npixels);
         return gray;
     }
 #endif
