@@ -1,3 +1,5 @@
+// Source: https://github.com/lecram/gifenc
+
 #ifndef GIFENC_H
 #define GIFENC_H
 

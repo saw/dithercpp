@@ -1,3 +1,5 @@
+// Source: https://github.com/lecram/gifenc
+
 #include "gifenc.h"
 
 #include <stdio.h>
